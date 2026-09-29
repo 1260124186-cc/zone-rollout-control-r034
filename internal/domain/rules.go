@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -41,6 +42,9 @@ func CompletePlan(plan *RolloutPlan, now time.Time) error {
 }
 
 func LeaseFingerprint(planID string, input LeaseInput) string {
+	// The capability segment is appended only when capability matching was
+	// requested, so legacy region-only requests keep the historical five-field
+	// fingerprint and pre-upgrade lease groups still replay correctly.
 	payload := fmt.Sprintf(
 		"%s|%s|%s|%d|%d",
 		planID,
@@ -49,6 +53,15 @@ func LeaseFingerprint(planID string, input LeaseInput) string {
 		input.LeaseSeconds,
 		input.MaxNodes,
 	)
+	if input.Capability != nil {
+		payload += "|cap=" + fmt.Sprintf(
+			"v%d|%s|%s|%s",
+			input.Capability.CatalogVersion,
+			strings.Join(input.Capability.Protocols, ","),
+			input.Capability.MinCapacityTier,
+			strings.Join(input.Capability.BusinessTags, ","),
+		)
+	}
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])
 }

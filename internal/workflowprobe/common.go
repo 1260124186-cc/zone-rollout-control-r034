@@ -71,6 +71,60 @@ func allocate(
 	return group, err
 }
 
+func allocateWithCapability(
+	harness *harness,
+	planID string,
+	requestKey string,
+	region string,
+	maxNodes int,
+	requirement *domain.CapabilityRequirement,
+) (domain.LeaseGroup, error) {
+	var group domain.LeaseGroup
+	err := harness.call(http.MethodPatch, "/v1/plans/"+planID+"/leases", domain.LeaseInput{
+		RequestKey:   requestKey,
+		Region:       region,
+		LeaseSeconds: 600,
+		MaxNodes:     maxNodes,
+		Capability:   requirement,
+	}, &group)
+	return group, err
+}
+
+func publishCatalog(
+	harness *harness,
+	requestKey string,
+	protocols []string,
+	tiers []string,
+	tags []string,
+) (domain.CapabilityCatalog, error) {
+	var catalog domain.CapabilityCatalog
+	err := harness.call(http.MethodPut, "/v1/capability-catalogs", domain.CatalogPublishInput{
+		RequestKey:    requestKey,
+		Protocols:     protocols,
+		CapacityTiers: tiers,
+		BusinessTags:  tags,
+	}, &catalog)
+	return catalog, err
+}
+
+func registerCapability(
+	harness *harness,
+	nodeID string,
+	catalogVersion uint64,
+	protocols []string,
+	tier string,
+	tags []string,
+) (domain.NodeCapabilityProfile, error) {
+	var profile domain.NodeCapabilityProfile
+	err := harness.call(http.MethodPut, "/v1/nodes/"+nodeID+"/capabilities", domain.NodeCapabilityInput{
+		CatalogVersion:   catalogVersion,
+		ProtocolVersions: protocols,
+		CapacityTier:     tier,
+		BusinessTags:     tags,
+	}, &profile)
+	return profile, err
+}
+
 func submitProbe(
 	harness *harness,
 	leaseID string,

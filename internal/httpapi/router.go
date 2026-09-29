@@ -7,6 +7,12 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("PUT /v1/nodes", s.enrollNode)
 	mux.HandleFunc("GET /v1/nodes", s.listNodes)
+	mux.HandleFunc("PUT /v1/nodes/{id}/capabilities", s.registerNodeCapability)
+	mux.HandleFunc("GET /v1/nodes/{id}/capabilities", s.getNodeCapabilities)
+
+	mux.HandleFunc("PUT /v1/capability-catalogs", s.publishCapabilityCatalog)
+	mux.HandleFunc("GET /v1/capability-catalogs/latest", s.latestCapabilityCatalog)
+	mux.HandleFunc("GET /v1/capability-catalogs/{version}", s.getCapabilityCatalog)
 
 	mux.HandleFunc("PUT /v1/plans", s.createPlan)
 	mux.HandleFunc("GET /v1/plans", s.listPlans)

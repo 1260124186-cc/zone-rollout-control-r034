@@ -26,7 +26,12 @@
     {
       "id": "allocation",
       "path": "internal/allocation",
-      "responsibility": "node selection, idempotent lease groups, and resource lifetime"
+      "responsibility": "region and capability node selection, idempotent lease groups, and resource lifetime"
+    },
+    {
+      "id": "capability",
+      "path": "internal/capability",
+      "responsibility": "versioned immutable capability catalogs and per-node capability profile registration"
     },
     {
       "id": "probe",
@@ -109,6 +114,29 @@
         "httpapi",
         "allocation",
         "plan",
+        "domain",
+        "storage"
+      ]
+    },
+    {
+      "id": "node-capability-matching",
+      "name": "Versioned node capability matching",
+      "entry": "PUT /v1/capability-catalogs, PUT /v1/nodes/{id}/capabilities, PATCH /v1/plans/{id}/leases",
+      "steps": [
+        "publish an immutable, versioned capability catalog with idempotent replay and duplicate rejection",
+        "register per-node capability profiles against an exact catalog version",
+        "filter ready nodes by region and then by protocol, capacity tier, and business tags",
+        "record the used catalog version and node profile snapshot on each lease and group selection",
+        "run concurrent duplicate registration and allocation to a deterministic outcome"
+      ],
+      "success": "only capable nodes in the region are selected and every lease explains the catalog version and profile used",
+      "failure": "no ready node in the region returns node_unavailable while present-but-insufficient nodes return capability_insufficient; duplicate registration, duplicate catalog, and same-key different-content requests return stable conflicts",
+      "verification": "workflowprobe node-capability-matching publishes catalogs, registers profiles, matches after region filtering, distinguishes the two failure modes, confirms upgrades never rewrite leases, keeps legacy nodes region-eligible, and serializes concurrent allocation",
+      "module_ids": [
+        "httpapi",
+        "capability",
+        "allocation",
+        "fleet",
         "domain",
         "storage"
       ]

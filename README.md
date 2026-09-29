@@ -2,7 +2,7 @@
 
 Zone Rollout Control 是仅依赖 Go 标准库的本机 HTTP 控制面，用于协调区域版本上线。它管理滚动计划、不可变区域版本、解析节点租约、探针结果和一致性判定。
 
-本仓库是健康项目初始化基线。当前不包含单元测试、夹具或浏览器测试；测试工作有意延后到后续测试阶段。现在通过真实 HTTP 路由的生产探针验证构建和四条核心工作流。
+本仓库是健康项目初始化基线。当前不包含单元测试、夹具或浏览器测试；测试工作有意延后到后续测试阶段。现在通过真实 HTTP 路由的生产探针验证构建和五条核心工作流。
 
 ## 环境要求
 
@@ -42,7 +42,8 @@ internal/store              锁内副本事务和原子 JSON 持久化
 internal/platform           时钟、标识、游标和文件锁
 internal/plan               计划及区域版本服务
 internal/fleet              解析节点档案服务
-internal/allocation         节点选择和租约生命周期
+internal/capability         版本化能力目录与节点能力档案
+internal/allocation         区域筛选、能力匹配和租约生命周期
 internal/probe              探针登记、幂等重放和租约完成
 internal/assessment         一致性聚合和最新结果查询
 internal/httpapi            HTTP 路由、中间件和响应映射
@@ -61,6 +62,32 @@ curl -sS -X PUT http://127.0.0.1:8090/v1/nodes \
   -d '{
     "node_name": "resolver-east-01",
     "region": "east"
+  }'
+```
+
+发布版本化能力目录（协议版本、容量等级顺序、业务标签）：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8090/v1/capability-catalogs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "catalog-publish-0001",
+    "protocols": ["dns-udp", "dot"],
+    "capacity_tiers": ["small", "large", "xlarge"],
+    "business_tags": ["core", "edge"]
+  }'
+```
+
+为节点登记某个目录版本下的能力档案（也可以完全不登记，继续走区域规则）：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8090/v1/nodes/<node_id>/capabilities \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "catalog_version": 1,
+    "protocol_versions": ["dot"],
+    "capacity_tier": "large",
+    "business_tags": ["edge"]
   }'
 ```
 
@@ -112,6 +139,27 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/leases \
     "max_nodes": 2
   }'
 ```
+
+在区域筛选后按显式能力条件分配（可选）。节点必须先登记 `catalog_version` 对应档案，并满足列出的全部协议、不低于 `min_capacity_tier` 的容量等级和全部业务标签。响应的 `selections` 以及每条租约都会写入匹配所用的目录版本和节点能力快照：
+
+```bash
+curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/leases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "lease-request-0002",
+    "region": "east",
+    "lease_seconds": 600,
+    "max_nodes": 2,
+    "capability": {
+      "catalog_version": 1,
+      "protocols": ["dot"],
+      "min_capacity_tier": "large",
+      "business_tags": ["edge"]
+    }
+  }'
+```
+
+区域内没有 ready 节点返回 `node_unavailable`；有 ready 节点但没有任何节点满足能力条件返回 `capability_insufficient`。
 
 提交探针：
 
@@ -167,6 +215,11 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 | `GET` | `/healthz` | 进程健康检查 |
 | `PUT` | `/v1/nodes` | 登记解析节点 |
 | `GET` | `/v1/nodes` | 按状态和区域分页查询节点 |
+| `PUT` | `/v1/nodes/{id}/capabilities` | 登记节点在某目录版本下的能力档案 |
+| `GET` | `/v1/nodes/{id}/capabilities` | 查询节点的全部版本能力档案 |
+| `PUT` | `/v1/capability-catalogs` | 发布新的不可变能力目录版本 |
+| `GET` | `/v1/capability-catalogs/latest` | 查询最新能力目录 |
+| `GET` | `/v1/capability-catalogs/{version}` | 查询指定版本能力目录 |
 | `PUT` | `/v1/plans` | 创建计划草稿 |
 | `GET` | `/v1/plans` | 按状态分页查询计划 |
 | `GET` | `/v1/plans/{id}` | 查询计划 |
@@ -186,6 +239,11 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 - A、AAAA、CNAME 条目在写入前规范化并稳定排序，重复条目直接拒绝。
 - 节点按 `ready -> leased -> ready` 变化，隔离节点不会被选中。
 - 一个节点同一时刻最多有一个 `claimed` 租约。
+- 能力目录按不可变新版本追加；重复内容返回 `duplicate_catalog`，相同请求键相同内容安全重放，同键异载荷返回 `idempotency_conflict`。
+- 节点能力按目录版本登记且不可变；相同内容安全重放，同版本异内容返回 `duplicate_capability`。
+- 能力分配先按区域筛选，再按协议版本、最低容量等级和业务标签匹配；无节点与能力不足分别返回 `node_unavailable` 和 `capability_insufficient`。
+- 匹配所用的目录版本和节点能力快照写入租约和租约组 `selections`，目录升级不追溯改写已有租约。
+- 不声明能力的旧节点继续按区域规则参与不带能力条件的分配。
 - 相同请求键和相同内容可安全重放；同键异载荷返回 `idempotency_conflict`。
 - 一致性判定综合节点覆盖率、序列号、成功比例和最大延迟，返回 `consistent` 或 `review_required`。
 - 所有校验和冲突在快照替换前返回，不留下部分状态。
@@ -197,23 +255,25 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 1. 计划草稿、区域版本、激活、完成和版本冲突。
 2. DNS 名称规范化、IP 校验、条目去重和稳定排序。
 3. 序列号递增与重复版本拒绝。
-4. 节点隔离、区域筛选、稳定选择和唯一租约。
-5. 租约期限、释放、过期清理和重复释放。
-6. 租约请求键与请求指纹重放。
-7. 探针请求键、载荷指纹、租约完成原子性和冲突检测。
-8. 成功率、节点覆盖、序列号一致性和延迟上限计算。
-9. 原子快照替换、文件锁、进程关闭和并发事务串行化。
-10. 严格 JSON 解码、分页游标和领域错误到 HTTP 状态的映射。
+4. 节点隔离、区域筛选、稳定选择、唯一租约。
+5. 版本化能力目录、节点能力档案、区域后能力匹配、租约能力解释、目录升级不追溯和并发确定性。
+6. 租约期限、释放、过期清理和重复释放。
+7. 租约请求键与请求指纹重放。
+8. 探针请求键、载荷指纹、租约完成原子性和冲突检测。
+9. 成功率、节点覆盖、序列号一致性和延迟上限计算。
+10. 原子快照替换、文件锁、进程关闭和并发事务串行化。
+11. 严格 JSON 解码、分页游标和领域错误到 HTTP 状态的映射。
 
 这些是正常运行机制，不是预置缺陷，也不包含缺陷票据、参考答案或测试文件。
 
 ## 验证
 
-测试阶段有意延后，因此当前不运行单元测试或浏览器测试。以下命令分别验证四条工作流；每条命令启动真实本机 HTTP 服务、使用独立临时状态、覆盖成功与失败路径，然后关闭服务：
+测试阶段有意延后，因此当前不运行单元测试或浏览器测试。以下命令分别验证五条工作流；每条命令启动真实本机 HTTP 服务、使用独立临时状态、覆盖成功与失败路径，然后关闭服务：
 
 ```bash
 go run ./cmd/workflowprobe plan-revision-lifecycle
 go run ./cmd/workflowprobe node-lease-allocation
+go run ./cmd/workflowprobe node-capability-matching
 go run ./cmd/workflowprobe probe-ingestion
 go run ./cmd/workflowprobe consistency-assessment
 ```

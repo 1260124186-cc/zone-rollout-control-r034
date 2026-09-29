@@ -39,6 +39,30 @@ func normalize(state domain.State) domain.State {
 	if state.AssessmentRequestKeys == nil {
 		state.AssessmentRequestKeys = make(map[string]string)
 	}
+	if state.CapabilityCatalogs == nil {
+		state.CapabilityCatalogs = make(map[uint64]domain.CapabilityCatalog)
+	}
+	if state.CatalogRequestKeys == nil {
+		state.CatalogRequestKeys = make(map[string]uint64)
+	}
+	if state.NodeCapabilities == nil {
+		state.NodeCapabilities = make(map[string]map[uint64]domain.NodeCapabilityProfile)
+	}
+	for nodeID, profiles := range state.NodeCapabilities {
+		if profiles == nil {
+			state.NodeCapabilities[nodeID] = make(map[uint64]domain.NodeCapabilityProfile)
+		}
+	}
+	// Re-derive the latest catalog version defensively from stored versions.
+	var latest uint64
+	for version := range state.CapabilityCatalogs {
+		if version > latest {
+			latest = version
+		}
+	}
+	if state.LatestCapabilityVersion < latest {
+		state.LatestCapabilityVersion = latest
+	}
 	if state.AuditEvents == nil {
 		state.AuditEvents = []domain.AuditEvent{}
 	}

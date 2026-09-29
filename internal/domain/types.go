@@ -89,20 +89,28 @@ type NodeLease struct {
 	NodeID       string     `json:"node_id"`
 	AllocationID string     `json:"allocation_id"`
 	State        LeaseState `json:"state"`
-	ClaimedAt    time.Time  `json:"claimed_at"`
-	ExpiresAt    time.Time  `json:"expires_at"`
-	FinishedAt   *time.Time `json:"finished_at,omitempty"`
-	ProbeID      string     `json:"probe_id,omitempty"`
+	// Capability is the immutable capability explanation captured at
+	// allocation time. It stays nil for legacy region-only allocations and is
+	// never rewritten when the capability directory is upgraded.
+	Capability *LeaseCapability `json:"capability,omitempty"`
+	ClaimedAt  time.Time        `json:"claimed_at"`
+	ExpiresAt  time.Time        `json:"expires_at"`
+	FinishedAt *time.Time       `json:"finished_at,omitempty"`
+	ProbeID    string           `json:"probe_id,omitempty"`
 }
 
 type LeaseGroup struct {
-	ID                 string    `json:"id"`
-	PlanID             string    `json:"plan_id"`
-	RequestKey         string    `json:"request_key"`
-	RequestFingerprint string    `json:"request_fingerprint"`
-	Region             string    `json:"region,omitempty"`
-	LeaseIDs           []string  `json:"lease_ids"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                 string `json:"id"`
+	PlanID             string `json:"plan_id"`
+	RequestKey         string `json:"request_key"`
+	RequestFingerprint string `json:"request_fingerprint"`
+	Region             string `json:"region,omitempty"`
+	// Requirement records the explicit capability conditions the group was
+	// matched under. nil means the group used legacy region-only selection.
+	Requirement *CapabilityRequirement `json:"requirement,omitempty"`
+	Selections  []LeaseSelection       `json:"selections"`
+	LeaseIDs    []string               `json:"lease_ids"`
+	CreatedAt   time.Time              `json:"created_at"`
 }
 
 type Probe struct {
@@ -154,7 +162,15 @@ type State struct {
 	Assessments           map[string]RolloutAssessment `json:"assessments"`
 	LeaseRequestKeys      map[string]string            `json:"lease_request_keys"`
 	AssessmentRequestKeys map[string]string            `json:"assessment_request_keys"`
-	AuditEvents           []AuditEvent                 `json:"audit_events"`
+	// CapabilityCatalogs is keyed by the monotonic catalog version.
+	CapabilityCatalogs map[uint64]CapabilityCatalog `json:"capability_catalogs"`
+	// LatestCapabilityVersion is the highest published catalog version.
+	LatestCapabilityVersion uint64 `json:"latest_capability_version"`
+	// CatalogRequestKeys maps the global publish request key to its version.
+	CatalogRequestKeys map[string]uint64 `json:"catalog_request_keys"`
+	// NodeCapabilities is keyed by node id and then by catalog version.
+	NodeCapabilities map[string]map[uint64]NodeCapabilityProfile `json:"node_capabilities"`
+	AuditEvents      []AuditEvent                                `json:"audit_events"`
 }
 
 type PageMeta struct {

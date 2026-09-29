@@ -48,12 +48,41 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `state`：`ready`、`leased` 或 `quarantined`。
 - `version`、`created_at`、`updated_at`。
 
+节点可以不声明任何能力；未声明能力的旧节点继续按区域规则参与分配。
+
+### CapabilityCatalog
+
+版本化、不可变的能力目录。每次发布得到一个严格递增的新版本，旧版本永久保留。
+
+- `version`：从 1 开始的单调递增版本号。
+- `protocols`：协议版本词汇表，规范化为小写、去重并排序。
+- `capacity_tiers`：容量等级词汇表，按列表位置定义由低到高的等级顺序。
+- `business_tags`：业务标签词汇表，规范化为小写、去重并排序。
+- `fingerprint`：上述三类词汇的稳定指纹，用于识别重复目录。
+- `request_key`：首次发布该版本的请求键。
+- `created_at`。
+
+目录只追加、不改写：发布新版本不会改变任何已有节点档案或租约。
+
+### NodeCapabilityProfile
+
+某个节点针对一个确切目录版本声明的能力档案。
+
+- `node_id`、`catalog_version`。
+- `protocol_versions`：该节点支持的协议版本，必须全部存在于对应目录。
+- `capacity_tier`：节点容量等级，必须存在于对应目录。
+- `business_tags`：节点业务标签，必须全部存在于对应目录。
+- `created_at`、`updated_at`。
+
+同一节点对同一目录版本的声明不可变：重复登记完全相同的内容返回原档案，内容不同返回 `duplicate_capability`。节点可对不同目录版本各持有一份档案；目录升级不覆盖旧档案。
+
 ### NodeLease
 
 计划对某个解析节点的有期限占用。
 
 - `id`、`plan_id`、`node_id`、`allocation_id`。
 - `state`：`claimed`、`reported`、`released` 或 `expired`。
+- `capability`：能力分配时写入的不可变能力解释（`catalog_version`、匹配时节点声明的 `protocol_versions`、`capacity_tier`、`business_tags`）。仅区域筛选的旧分配不含该字段；目录升级永不改写它。
 - `claimed_at`、`expires_at`、`finished_at`。
 - `probe_id`：成功登记探针后的结果标识。
 
@@ -62,6 +91,8 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 一次租约分配请求的幂等记录。
 
 - `id`、`plan_id`、`request_key`、`request_fingerprint`、`region`、`lease_ids`。
+- `requirement`：本次匹配使用的显式能力条件（含 `catalog_version`、`protocols`、`min_capacity_tier`、`business_tags`）；缺省表示仅按区域的旧分配。
+- `selections`：每个租约选择了哪个节点及其能力解释，用于说明“为什么是这个节点、按哪个能力版本”。
 - 相同请求键和相同内容重放时返回原分配组，内容不一致时返回冲突。
 
 ### Probe
@@ -107,6 +138,22 @@ ready --lease--> leased --report--> ready
 - 一个节点同一时刻最多有一个 `claimed` 租约。
 - 租约到期后不能提交探针。
 - 首次有效探针完成后，租约转为 `reported`，节点恢复 `ready`。
+
+### 能力目录与能力匹配
+
+- 能力目录按版本追加发布，版本号单调递增；词汇项规范化为小写，协议与标签去重排序，容量等级保持给定顺序作为等级排序。
+- 目录内容完全相同（忽略请求键）的重复发布返回 `duplicate_catalog`；相同请求键相同内容重放返回原版本；相同请求键不同内容返回 `idempotency_conflict`。
+- 节点按确切目录版本登记能力，声明值必须全部出现在该版本词汇表内。
+- 同一节点对同一目录版本的相同声明可安全重放；不同声明返回 `duplicate_capability`，不覆盖旧声明。
+- 分配请求带 `capability` 时，先按区域筛出 `ready` 节点，再要求节点持有该目录版本的档案，并满足全部显式条件：
+  - `protocols`：节点必须支持列出的全部协议版本。
+  - `min_capacity_tier`：节点容量等级在目录顺序中不低于要求等级。
+  - `business_tags`：节点必须包含列出的全部业务标签。
+- 区域内没有任何 `ready` 节点时返回 `node_unavailable`；有 `ready` 节点但无一满足能力条件时返回 `capability_insufficient`，两者可区分。
+- 能力条件中的版本与词汇必须存在，引用不存在的目录版本返回 `not_found`，引用目录中不存在的词汇返回 `validation_failed`。
+- 分配确定后，把匹配所用的目录版本和节点声明快照写入每条租约和租约组 `selections`；之后发布新目录版本或为节点追加新档案都不追溯改写已有租约。
+- 分配请求不带 `capability` 时维持原区域规则：未声明任何能力的旧节点照常参与，租约不写能力解释。
+- 目录发布、档案登记和租约分配都在同一互斥锁事务内串行化，因此并发重复登记、目录升级与并发分配都有确定结果：相同登记收敛为同一份档案，并发分配对同一节点至多成功一次，其余按当时状态得到确定性的 `capability_insufficient`。
 
 ### 区域版本规则
 
@@ -170,14 +217,34 @@ ready --lease--> leased --report--> ready
 
 步骤：
 
-1. 入口校验计划、区域、请求键、租约秒数和数量。
+1. 入口校验计划、区域、请求键、租约秒数和数量；携带能力条件时校验条件形状。
 2. 分配服务清理已到期租约。
-3. 按区域筛选 `ready` 节点并以稳定顺序选择。
-4. 在一个事务中把节点改为 `leased`，写入租约组和租约。
+3. 按区域筛选 `ready` 节点；存在能力条件时，载入所引用的确切目录版本并校验条件词汇，再筛掉未声明该版本档案或不满足协议、容量等级、业务标签条件的节点。
+4. 在一个事务中把节点改为 `leased`，写入租约组和租约，并把所用能力版本与节点能力快照写入租约解释。
 
-成功行为：每个节点获得一个有期限的 `claimed` 租约。
+成功行为：每个节点获得一个有期限的 `claimed` 租约；能力分配的租约和租约组 `selections` 都携带目录版本和节点声明快照。
 
-失败行为：计划非活动、无可用节点、请求键同键异载荷或保存失败时不会产生部分租约。
+失败行为：计划非活动、无可用节点（`node_unavailable`）、有节点但能力不足（`capability_insufficient`）、请求键同键异载荷或保存失败时不会产生部分租约。
+
+### W2b 能力目录与节点能力登记
+
+入口：
+
+- `PUT /v1/capability-catalogs`
+- `GET /v1/capability-catalogs/latest`
+- `GET /v1/capability-catalogs/{version}`
+- `PUT /v1/nodes/{id}/capabilities`
+- `GET /v1/nodes/{id}/capabilities`
+
+步骤：
+
+1. HTTP 层严格解码并规范化小写词汇、去重排序与容量等级顺序。
+2. 能力服务在锁内校验请求键幂等、目录内容重复和版本号递增。
+3. 节点档案在锁内校验节点存在、目录版本存在和词汇归属，再按“节点 + 目录版本”幂等写入。
+
+成功行为：目录按不可变新版本追加，节点按版本持有不可变能力档案。
+
+失败行为：重复目录、重复登记冲突、同键异载荷、未知节点、未知目录版本或越界词汇都不会修改状态。
 
 ### W3 探针登记
 
@@ -220,7 +287,8 @@ ready --lease--> leased --report--> ready
 | httpapi | `internal/httpapi` | 路由、严格解码、中间件和错误映射 |
 | plan | `internal/plan` | 计划生命周期和区域版本规则 |
 | fleet | `internal/fleet` | 解析节点档案、唯一名称和分页查询 |
-| allocation | `internal/allocation` | 节点筛选、幂等分配组和租约生命周期 |
+| capability | `internal/capability` | 版本化能力目录发布和节点能力档案登记 |
+| allocation | `internal/allocation` | 区域与能力两级筛选、幂等分配组、租约生命周期和能力解释 |
 | probe | `internal/probe` | 探针校验、幂等写入和租约完成 |
 | assessment | `internal/assessment` | 探针聚合和一致性判定 |
 | domain | `internal/domain` | 聚合、值校验、状态迁移和纯计算 |
@@ -249,6 +317,11 @@ ready --lease--> leased --report--> ready
 - `GET /healthz`
 - `PUT /v1/nodes`
 - `GET /v1/nodes`
+- `PUT /v1/nodes/{id}/capabilities`
+- `GET /v1/nodes/{id}/capabilities`
+- `PUT /v1/capability-catalogs`
+- `GET /v1/capability-catalogs/latest`
+- `GET /v1/capability-catalogs/{version}`
 - `PUT /v1/plans`
 - `GET /v1/plans`
 - `GET /v1/plans/{id}`
@@ -280,7 +353,8 @@ ready --lease--> leased --report--> ready
 
 1. 计划创建、版本追加、激活、完成和非法重复迁移。
 2. 节点分配、租约唯一性、幂等重放和无可用节点冲突。
-3. 探针首写、同键重放、同键异载荷冲突和释放冲突。
-4. 一致性通过、审核触发、最新结果查询和幂等重放。
+3. 能力目录发布与重放、节点能力重复登记、区域后能力匹配、能力不足与无节点区分、目录升级不追溯、旧节点区域分配和并发分配确定性。
+4. 探针首写、同键重放、同键异载荷冲突和释放冲突。
+5. 一致性通过、审核触发、最新结果查询和幂等重放。
 
 每条探针使用独立临时目录，不访问外部网络，结束后关闭服务。

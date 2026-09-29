@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"net"
 	"sort"
 	"strings"
@@ -38,10 +39,11 @@ type NodeCreateInput struct {
 }
 
 type LeaseInput struct {
-	RequestKey   string `json:"request_key"`
-	Region       string `json:"region"`
-	LeaseSeconds int    `json:"lease_seconds"`
-	MaxNodes     int    `json:"max_nodes"`
+	RequestKey   string                 `json:"request_key"`
+	Region       string                 `json:"region"`
+	LeaseSeconds int                    `json:"lease_seconds"`
+	MaxNodes     int                    `json:"max_nodes"`
+	Capability   *CapabilityRequirement `json:"capability,omitempty"`
 }
 
 type ProbeInput struct {
@@ -197,9 +199,17 @@ func NormalizeNodeInput(input NodeCreateInput) NodeCreateInput {
 	return input
 }
 
-func ValidateLeaseInput(input LeaseInput) error {
+// NormalizeLeaseInput canonicalizes the region and optional capability
+// requirement before validation and fingerprinting.
+func NormalizeLeaseInput(input LeaseInput) LeaseInput {
 	input.RequestKey = strings.TrimSpace(input.RequestKey)
 	input.Region = strings.TrimSpace(strings.ToLower(input.Region))
+	input.Capability = NormalizeCapabilityRequirement(input.Capability)
+	return input
+}
+
+func ValidateLeaseInput(input LeaseInput) error {
+	input = NormalizeLeaseInput(input)
 	details := make(map[string]any)
 	if err := validateRequestKey(input.RequestKey); err != nil {
 		details["request_key"] = err.Error()
@@ -212,6 +222,14 @@ func ValidateLeaseInput(input LeaseInput) error {
 	}
 	if input.MaxNodes < 1 || input.MaxNodes > 100 {
 		details["max_nodes"] = "must be between 1 and 100"
+	}
+	if input.Capability != nil {
+		if err := ValidateCapabilityRequirementShape(*input.Capability); err != nil {
+			var target *DomainError
+			if errors.As(err, &target) {
+				details["capability"] = target.Details
+			}
+		}
 	}
 	if len(details) > 0 {
 		return Validation("lease input is invalid", details)
