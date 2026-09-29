@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"solo-0014-zone-rollout-control/internal/capability"
 	"solo-0014-zone-rollout-control/internal/domain"
 	"solo-0014-zone-rollout-control/internal/platform"
 	"solo-0014-zone-rollout-control/internal/store"
@@ -30,6 +31,14 @@ func (s *Service) Allocate(
 		return domain.LeaseGroup{}, err
 	}
 	input.Region = strings.TrimSpace(strings.ToLower(input.Region))
+	if input.Capability != nil {
+		normalized := domain.NormalizeCapabilityMatch(*input.Capability)
+		if !domain.CapabilityMatchRequested(normalized) {
+			input.Capability = nil
+		} else {
+			input.Capability = &normalized
+		}
+	}
 	requestIndex := planID + "\x00" + input.RequestKey
 	fingerprint := domain.LeaseFingerprint(planID, input)
 	now := s.clock.Now().UTC()
@@ -63,7 +72,9 @@ func (s *Service) Allocate(
 		}
 
 		expireLeases(state, now)
-		candidates := make([]domain.ResolverNode, 0)
+
+		// 第一步：仅按现有区域规则筛选 ready 节点并稳定排序。
+		regional := make([]domain.ResolverNode, 0)
 		for _, node := range state.Nodes {
 			if node.State != domain.NodeReady {
 				continue
@@ -71,20 +82,56 @@ func (s *Service) Allocate(
 			if input.Region != "" && node.Region != input.Region {
 				continue
 			}
-			candidates = append(candidates, node)
+			regional = append(regional, node)
 		}
-		if len(candidates) == 0 {
+		if len(regional) == 0 {
 			return domain.NewError(domain.CodeNodeUnavailable, "no eligible node is ready", map[string]any{
 				"plan_id": planID,
 				"region":  input.Region,
 			})
 		}
-		sort.Slice(candidates, func(i, j int) bool {
-			if candidates[i].Region != candidates[j].Region {
-				return candidates[i].Region < candidates[j].Region
+		sort.Slice(regional, func(i, j int) bool {
+			if regional[i].Region != regional[j].Region {
+				return regional[i].Region < regional[j].Region
 			}
-			return candidates[i].ID < candidates[j].ID
+			return regional[i].ID < regional[j].ID
 		})
+
+		// 第二步：在区域候选集之上按明确能力条件筛选。未声明能力的旧
+		// 节点仅在请求不提出能力条件时参与；提出条件时档案缺失即不匹配。
+		// 区域内有节点但全部不满足能力条件时使用独立错误代码。
+		type selected struct {
+			node    domain.ResolverNode
+			profile *domain.NodeCapabilityProfile
+		}
+		candidates := make([]selected, 0, len(regional))
+		if input.Capability == nil {
+			for _, node := range regional {
+				candidates = append(candidates, selected{node: node})
+			}
+		} else {
+			for _, node := range regional {
+				profile, hasProfile := capability.LatestProfile(state, node.ID)
+				if !hasProfile {
+					continue
+				}
+				if !domain.ProfileSatisfies(profile, *input.Capability) {
+					continue
+				}
+				profileCopy := profile
+				candidates = append(candidates, selected{node: node, profile: &profileCopy})
+			}
+			if len(candidates) == 0 {
+				return domain.NewError(domain.CodeCapabilityInsufficient, "no ready node satisfies the requested capability conditions", map[string]any{
+					"plan_id":                    planID,
+					"region":                     input.Region,
+					"regional_candidate_count":   len(regional),
+					"required_protocol_versions": input.Capability.RequiredProtocolVersions,
+					"minimum_capacity_tier":      input.Capability.MinimumCapacityTier,
+					"required_tags":              input.Capability.RequiredTags,
+				})
+			}
+		}
 		if len(candidates) > input.MaxNodes {
 			candidates = candidates[:input.MaxNodes]
 		}
@@ -94,18 +141,37 @@ func (s *Service) Allocate(
 		expiresAt := now.Add(time.Duration(input.LeaseSeconds) * time.Second)
 		for _, candidate := range candidates {
 			leaseID := s.ids.New("lse")
-			candidate.State = domain.NodeLeased
-			candidate.Version++
-			candidate.UpdatedAt = now
-			state.Nodes[candidate.ID] = candidate
+			candidate.node.State = domain.NodeLeased
+			candidate.node.Version++
+			candidate.node.UpdatedAt = now
+			state.Nodes[candidate.node.ID] = candidate.node
+
+			explanation := &domain.LeaseExplanation{
+				Region: input.Region,
+			}
+			if input.Capability != nil {
+				matchCopy := *input.Capability
+				explanation.CapabilityMatch = &matchCopy
+				// 能力版本在租约创建时固化；之后目录升级不追溯改写。
+				explanation.Capability = &domain.CapabilityTrace{
+					ProfileID:         candidate.profile.ID,
+					ProfileVersion:    candidate.profile.ProfileVersion,
+					ProtocolVersions:  append([]string(nil), candidate.profile.ProtocolVersions...),
+					CapacityTier:      candidate.profile.CapacityTier,
+					Tags:              append([]string(nil), candidate.profile.Tags...),
+					MatchedConditions: domain.MatchedConditions(*candidate.profile, *input.Capability),
+					RecordedAt:        now,
+				}
+			}
 			state.Leases[leaseID] = domain.NodeLease{
 				ID:           leaseID,
 				PlanID:       planID,
-				NodeID:       candidate.ID,
+				NodeID:       candidate.node.ID,
 				AllocationID: groupID,
 				State:        domain.LeaseClaimed,
 				ClaimedAt:    now,
 				ExpiresAt:    expiresAt,
+				Explanation:  explanation,
 			}
 			leaseIDs = append(leaseIDs, leaseID)
 		}
@@ -115,18 +181,37 @@ func (s *Service) Allocate(
 			RequestKey:         input.RequestKey,
 			RequestFingerprint: fingerprint,
 			Region:             input.Region,
+			CapabilityMatch:    input.Capability,
 			LeaseIDs:           leaseIDs,
 			CreatedAt:          now,
 		}
 		state.LeaseGroups[group.ID] = group
 		state.LeaseRequestKeys[requestIndex] = group.ID
-		store.AddAudit(state, s.ids, "lease_group", group.ID, "created", now, map[string]any{
+		auditAttributes := map[string]any{
 			"plan_id":     planID,
 			"lease_count": len(leaseIDs),
-		})
+		}
+		if input.Capability != nil {
+			auditAttributes["capability_requested"] = true
+		}
+		store.AddAudit(state, s.ids, "lease_group", group.ID, "created", now, auditAttributes)
 		return nil
 	})
 	return group, err
+}
+
+// GetLease 返回单个租约（含其固化的分配解释）。
+func (s *Service) GetLease(ctx context.Context, leaseID string) (domain.NodeLease, error) {
+	var lease domain.NodeLease
+	err := s.store.Read(ctx, func(state *domain.State) error {
+		found, ok := state.Leases[leaseID]
+		if !ok {
+			return domain.NotFound("lease", leaseID)
+		}
+		lease = found
+		return nil
+	})
+	return lease, err
 }
 
 func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease, error) {

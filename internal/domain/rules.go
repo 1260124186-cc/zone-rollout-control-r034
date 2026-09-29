@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -42,15 +43,96 @@ func CompletePlan(plan *RolloutPlan, now time.Time) error {
 
 func LeaseFingerprint(planID string, input LeaseInput) string {
 	payload := fmt.Sprintf(
-		"%s|%s|%s|%d|%d",
+		"%s|%s|%s|%d|%d|%s",
 		planID,
 		input.RequestKey,
 		input.Region,
 		input.LeaseSeconds,
 		input.MaxNodes,
+		CapabilityMatchFingerprint(input.Capability),
 	)
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])
+}
+
+// CapabilityMatchFingerprint 生成能力条件的稳定指纹；空条件得到固定空串，
+// 使不提出能力条件的请求与历史行为完全一致。
+func CapabilityMatchFingerprint(match *CapabilityMatch) string {
+	if match == nil {
+		return ""
+	}
+	payload := strings.Join(match.RequiredProtocolVersions, ",") +
+		"|" + match.MinimumCapacityTier +
+		"|" + strings.Join(match.RequiredTags, ",")
+	if payload == "||" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+// CapabilityProfileFingerprint 生成档案内容指纹，用于重复登记的确定性去重。
+func CapabilityProfileFingerprint(input CapabilityProfileInput) string {
+	payload := strings.Join(input.ProtocolVersions, ",") +
+		"|" + input.CapacityTier +
+		"|" + strings.Join(input.Tags, ",")
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+// ProfileSatisfies 是纯领域匹配：声明档案是否满足给定能力条件。
+// 调用方负责先完成规范化与校验。
+func ProfileSatisfies(profile NodeCapabilityProfile, match CapabilityMatch) bool {
+	for _, required := range match.RequiredProtocolVersions {
+		if !containsString(profile.ProtocolVersions, required) {
+			return false
+		}
+	}
+	if match.MinimumCapacityTier != "" {
+		requiredRank, _ := CapacityRank(CapacityTier(match.MinimumCapacityTier))
+		actualRank, ok := CapacityRank(profile.CapacityTier)
+		if !ok || actualRank < requiredRank {
+			return false
+		}
+	}
+	for _, required := range match.RequiredTags {
+		if !containsString(profile.Tags, required) {
+			return false
+		}
+	}
+	return true
+}
+
+// MatchedConditions 按稳定顺序返回该档案满足条件时实际命中的条件代码。
+func MatchedConditions(profile NodeCapabilityProfile, match CapabilityMatch) []string {
+	conditions := make([]string, 0)
+	for _, required := range match.RequiredProtocolVersions {
+		if containsString(profile.ProtocolVersions, required) {
+			conditions = append(conditions, "protocol:"+required)
+		}
+	}
+	if match.MinimumCapacityTier != "" {
+		if requiredRank, ok := CapacityRank(CapacityTier(match.MinimumCapacityTier)); ok {
+			if actualRank, found := CapacityRank(profile.CapacityTier); found && actualRank >= requiredRank {
+				conditions = append(conditions, "capacity_tier>="+match.MinimumCapacityTier)
+			}
+		}
+	}
+	for _, required := range match.RequiredTags {
+		if containsString(profile.Tags, required) {
+			conditions = append(conditions, "tag:"+required)
+		}
+	}
+	return conditions
+}
+
+func containsString(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }
 
 func ProbeFingerprint(leaseID string, input ProbeInput) string {

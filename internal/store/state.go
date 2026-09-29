@@ -39,6 +39,9 @@ func normalize(state domain.State) domain.State {
 	if state.AssessmentRequestKeys == nil {
 		state.AssessmentRequestKeys = make(map[string]string)
 	}
+	if state.NodeCapabilities == nil {
+		state.NodeCapabilities = make(map[string][]domain.NodeCapabilityProfile)
+	}
 	if state.AuditEvents == nil {
 		state.AuditEvents = []domain.AuditEvent{}
 	}

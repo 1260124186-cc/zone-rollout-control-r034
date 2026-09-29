@@ -48,6 +48,29 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `state`：`ready`、`leased` 或 `quarantined`。
 - `version`、`created_at`、`updated_at`。
 
+### NodeCapabilityProfile
+
+节点在单个版本下声明的能力档案。能力与节点档案分离，按节点只追加。
+
+- `id`、`node_id`、`profile_version`（该节点内从 1 严格递增）。
+- `protocol_versions`：非空协议版本集合，来自受支持集合，规范化去重并稳定排序。
+- `capacity_tier`：`small`、`medium`、`large`、`xlarge`，按此顺序可比较。
+- `tags`：业务标签集合，小写字母、数字、连字符和下划线，至多 20 个。
+- `content_fingerprint`：规范化内容的稳定指纹，由服务计算。
+- `created_at`。
+
+重新登记完全相同的内容（忽略字段顺序与大小写）返回既有版本；登记不同内容追加新版本。旧版本不可变，升级不追溯改写任何已有租约。从未登记能力档案的节点被视为未声明能力。
+
+### CapabilityMatch
+
+分配请求在区域筛选之后提出的能力条件。
+
+- `required_protocol_versions`：节点档案必须全部包含。
+- `minimum_capacity_tier`：节点容量等级必须不低于该值。
+- `required_tags`：节点标签必须全部包含。
+
+三个条件全部为空等价于不提出能力条件，此时节点仅按区域规则参与。
+
 ### NodeLease
 
 计划对某个解析节点的有期限占用。
@@ -56,13 +79,14 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `state`：`claimed`、`reported`、`released` 或 `expired`。
 - `claimed_at`、`expires_at`、`finished_at`。
 - `probe_id`：成功登记探针后的结果标识。
+- `explanation`：租约创建时固化的分配解释，包含区域、提出的能力条件和命中的 `CapabilityTrace`；`CapabilityTrace` 记录实际使用的能力档案 `profile_id`、`profile_version` 和内容快照。之后的目录升级不会修改它。
 
 ### LeaseGroup
 
 一次租约分配请求的幂等记录。
 
-- `id`、`plan_id`、`request_key`、`request_fingerprint`、`region`、`lease_ids`。
-- 相同请求键和相同内容重放时返回原分配组，内容不一致时返回冲突。
+- `id`、`plan_id`、`request_key`、`request_fingerprint`、`region`、`capability_match`、`lease_ids`。
+- 相同请求键和相同内容重放时返回原分配组，内容不一致时返回冲突。能力条件属于请求内容，纳入指纹。
 
 ### Probe
 
@@ -107,6 +131,10 @@ ready --lease--> leased --report--> ready
 - 一个节点同一时刻最多有一个 `claimed` 租约。
 - 租约到期后不能提交探针。
 - 首次有效探针完成后，租约转为 `reported`，节点恢复 `ready`。
+- 分配先按区域筛选 `ready` 节点，再按明确能力条件匹配：未声明能力的旧节点仅在请求不提出能力条件时参与。
+- 区域内没有任何 `ready` 节点返回 `node_unavailable`；有区域候选但全部不满足能力条件返回 `capability_insufficient`，两者稳定可区分。
+- 能力条件命中后，实际使用的能力档案版本快照写入租约解释；目录后续升级不追溯改写已有租约。
+- 重复能力登记返回既有版本，不同内容追加新版本；并发登记和并发分配经存储写锁串行化，结果确定。
 
 ### 区域版本规则
 
@@ -173,11 +201,29 @@ ready --lease--> leased --report--> ready
 1. 入口校验计划、区域、请求键、租约秒数和数量。
 2. 分配服务清理已到期租约。
 3. 按区域筛选 `ready` 节点并以稳定顺序选择。
-4. 在一个事务中把节点改为 `leased`，写入租约组和租约。
+4. 若请求提出能力条件，在区域候选集上读取节点当前最新能力档案并按协议版本、容量等级和业务标签匹配。
+5. 在一个事务中把节点改为 `leased`，写入租约组和租约，并把命中的能力版本快照固化到每个租约的解释中。
 
-成功行为：每个节点获得一个有期限的 `claimed` 租约。
+成功行为：每个节点获得一个有期限的 `claimed` 租约，租约解释说明所用能力版本；不提出能力条件时旧节点照常按区域参与。
 
-失败行为：计划非活动、无可用节点、请求键同键异载荷或保存失败时不会产生部分租约。
+失败行为：计划非活动、无可用节点（`node_unavailable`）、能力不足（`capability_insufficient`）、请求键同键异载荷或保存失败时不会产生部分租约。
+
+### W2b 版本化能力档案
+
+入口：
+
+- `PUT /v1/nodes/{id}/capabilities`
+- `GET /v1/nodes/{id}/capabilities`
+
+步骤：
+
+1. 入口严格解码协议版本、容量等级和业务标签。
+2. 能力服务规范化（小写、去空白、去重、稳定排序）并显式校验。
+3. 存储层在锁内按内容指纹去重：命中则返回既有版本，否则追加下一版本号并审计。
+
+成功行为：相同内容重复登记返回既有版本（200），新内容产生新版本（201），历史版本保持可读。
+
+失败行为：未知节点返回 `not_found`，非法协议、容量等级或标签返回校验错误；并发登记串行化后只有一个确定结果。
 
 ### W3 探针登记
 
@@ -220,7 +266,8 @@ ready --lease--> leased --report--> ready
 | httpapi | `internal/httpapi` | 路由、严格解码、中间件和错误映射 |
 | plan | `internal/plan` | 计划生命周期和区域版本规则 |
 | fleet | `internal/fleet` | 解析节点档案、唯一名称和分页查询 |
-| allocation | `internal/allocation` | 节点筛选、幂等分配组和租约生命周期 |
+| capability | `internal/capability` | 版本化节点能力档案登记、内容去重和目录读取 |
+| allocation | `internal/allocation` | 区域与能力匹配、幂等分配组、租约生命周期和分配解释 |
 | probe | `internal/probe` | 探针校验、幂等写入和租约完成 |
 | assessment | `internal/assessment` | 探针聚合和一致性判定 |
 | domain | `internal/domain` | 聚合、值校验、状态迁移和纯计算 |
@@ -249,6 +296,8 @@ ready --lease--> leased --report--> ready
 - `GET /healthz`
 - `PUT /v1/nodes`
 - `GET /v1/nodes`
+- `PUT /v1/nodes/{id}/capabilities`
+- `GET /v1/nodes/{id}/capabilities`
 - `PUT /v1/plans`
 - `GET /v1/plans`
 - `GET /v1/plans/{id}`
@@ -256,6 +305,7 @@ ready --lease--> leased --report--> ready
 - `PATCH /v1/plans/{id}/activate`
 - `PATCH /v1/plans/{id}/complete`
 - `PATCH /v1/plans/{id}/leases`
+- `GET /v1/leases/{id}`
 - `PATCH /v1/leases/{id}/release`
 - `PATCH /v1/leases/{id}/probes`
 - `PATCH /v1/plans/{id}/assessments`
@@ -280,7 +330,8 @@ ready --lease--> leased --report--> ready
 
 1. 计划创建、版本追加、激活、完成和非法重复迁移。
 2. 节点分配、租约唯一性、幂等重放和无可用节点冲突。
-3. 探针首写、同键重放、同键异载荷冲突和释放冲突。
-4. 一致性通过、审核触发、最新结果查询和幂等重放。
+3. 能力档案登记去重、目录升级、按能力匹配、租约解释固化、能力不足与无节点区分，以及同键/异键并发分配。
+4. 探针首写、同键重放、同键异载荷冲突和释放冲突。
+5. 一致性通过、审核触发、最新结果查询和幂等重放。
 
 每条探针使用独立临时目录，不访问外部网络，结束后关闭服务。

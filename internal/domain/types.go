@@ -42,6 +42,57 @@ const (
 	EntryCNAME EntryType = "CNAME"
 )
 
+// CapacityTier 是节点能力档案声明的容量等级，按小到大排序。
+type CapacityTier string
+
+const (
+	CapacitySmall  CapacityTier = "small"
+	CapacityMedium CapacityTier = "medium"
+	CapacityLarge  CapacityTier = "large"
+	CapacityXLarge CapacityTier = "xlarge"
+)
+
+// NodeCapabilityProfile 是某个节点在一个版本下声明的能力快照。
+// 档案只追加不原地改写：重新登记不同内容会产生新版本，旧版本与
+// 已经引用旧版本的租约解释保持不变。
+type NodeCapabilityProfile struct {
+	ID                 string       `json:"id"`
+	NodeID             string       `json:"node_id"`
+	ProfileVersion     uint64       `json:"profile_version"`
+	ProtocolVersions   []string     `json:"protocol_versions"`
+	CapacityTier       CapacityTier `json:"capacity_tier"`
+	Tags               []string     `json:"tags"`
+	ContentFingerprint string       `json:"content_fingerprint"`
+	CreatedAt          time.Time    `json:"created_at"`
+}
+
+// CapabilityMatch 是分配请求在区域筛选之后提出的明确能力条件。
+// 三个字段全部为空时表示不提出能力条件，节点仅按现有区域规则参与。
+type CapabilityMatch struct {
+	RequiredProtocolVersions []string `json:"required_protocol_versions,omitempty"`
+	MinimumCapacityTier      string   `json:"minimum_capacity_tier,omitempty"`
+	RequiredTags             []string `json:"required_tags,omitempty"`
+}
+
+// CapabilityTrace 是租约对“当时选中了哪份能力”的解释快照。
+// 它在租约创建时固化，之后的目录升级不会追溯改写。
+type CapabilityTrace struct {
+	ProfileID         string       `json:"profile_id"`
+	ProfileVersion    uint64       `json:"profile_version"`
+	ProtocolVersions  []string     `json:"protocol_versions"`
+	CapacityTier      CapacityTier `json:"capacity_tier"`
+	Tags              []string     `json:"tags"`
+	MatchedConditions []string     `json:"matched_conditions"`
+	RecordedAt        time.Time    `json:"recorded_at"`
+}
+
+// LeaseExplanation 解释一次租约分配为何选中该节点。
+type LeaseExplanation struct {
+	Region          string           `json:"region,omitempty"`
+	CapabilityMatch *CapabilityMatch `json:"capability_match,omitempty"`
+	Capability      *CapabilityTrace `json:"capability,omitempty"`
+}
+
 type ZoneEntry struct {
 	Owner string    `json:"owner"`
 	Type  EntryType `json:"type"`
@@ -84,25 +135,27 @@ type ResolverNode struct {
 }
 
 type NodeLease struct {
-	ID           string     `json:"id"`
-	PlanID       string     `json:"plan_id"`
-	NodeID       string     `json:"node_id"`
-	AllocationID string     `json:"allocation_id"`
-	State        LeaseState `json:"state"`
-	ClaimedAt    time.Time  `json:"claimed_at"`
-	ExpiresAt    time.Time  `json:"expires_at"`
-	FinishedAt   *time.Time `json:"finished_at,omitempty"`
-	ProbeID      string     `json:"probe_id,omitempty"`
+	ID           string            `json:"id"`
+	PlanID       string            `json:"plan_id"`
+	NodeID       string            `json:"node_id"`
+	AllocationID string            `json:"allocation_id"`
+	State        LeaseState        `json:"state"`
+	ClaimedAt    time.Time         `json:"claimed_at"`
+	ExpiresAt    time.Time         `json:"expires_at"`
+	FinishedAt   *time.Time        `json:"finished_at,omitempty"`
+	ProbeID      string            `json:"probe_id,omitempty"`
+	Explanation  *LeaseExplanation `json:"explanation,omitempty"`
 }
 
 type LeaseGroup struct {
-	ID                 string    `json:"id"`
-	PlanID             string    `json:"plan_id"`
-	RequestKey         string    `json:"request_key"`
-	RequestFingerprint string    `json:"request_fingerprint"`
-	Region             string    `json:"region,omitempty"`
-	LeaseIDs           []string  `json:"lease_ids"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                 string           `json:"id"`
+	PlanID             string           `json:"plan_id"`
+	RequestKey         string           `json:"request_key"`
+	RequestFingerprint string           `json:"request_fingerprint"`
+	Region             string           `json:"region,omitempty"`
+	CapabilityMatch    *CapabilityMatch `json:"capability_match,omitempty"`
+	LeaseIDs           []string         `json:"lease_ids"`
+	CreatedAt          time.Time        `json:"created_at"`
 }
 
 type Probe struct {
@@ -154,7 +207,9 @@ type State struct {
 	Assessments           map[string]RolloutAssessment `json:"assessments"`
 	LeaseRequestKeys      map[string]string            `json:"lease_request_keys"`
 	AssessmentRequestKeys map[string]string            `json:"assessment_request_keys"`
-	AuditEvents           []AuditEvent                 `json:"audit_events"`
+	// NodeCapabilities 以节点 ID 为键保存该节点按版本顺序追加的能力档案。
+	NodeCapabilities map[string][]NodeCapabilityProfile `json:"node_capabilities"`
+	AuditEvents      []AuditEvent                       `json:"audit_events"`
 }
 
 type PageMeta struct {

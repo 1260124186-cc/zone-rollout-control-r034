@@ -42,7 +42,8 @@ internal/store              锁内副本事务和原子 JSON 持久化
 internal/platform           时钟、标识、游标和文件锁
 internal/plan               计划及区域版本服务
 internal/fleet              解析节点档案服务
-internal/allocation         节点选择和租约生命周期
+internal/capability         版本化节点能力档案目录
+internal/allocation         区域与能力匹配、租约生命周期和分配解释
 internal/probe              探针登记、幂等重放和租约完成
 internal/assessment         一致性聚合和最新结果查询
 internal/httpapi            HTTP 路由、中间件和响应映射
@@ -63,6 +64,20 @@ curl -sS -X PUT http://127.0.0.1:8090/v1/nodes \
     "region": "east"
   }'
 ```
+
+为节点登记版本化能力档案（协议版本、容量等级、业务标签）：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8090/v1/nodes/<node_id>/capabilities \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "protocol_versions": ["doh-http2", "dns-tcp"],
+    "capacity_tier": "medium",
+    "tags": ["edge", "beta"]
+  }'
+```
+
+相同内容重复登记（忽略字段顺序和大小写）返回 `200` 和既有版本，`created` 为 `false`；不同内容返回 `201` 并追加下一版本。可用 `GET /v1/nodes/<node_id>/capabilities` 按版本升序读取全部档案。
 
 创建滚动计划：
 
@@ -100,7 +115,7 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/activate \
   -d '{"expected_version": 2}'
 ```
 
-分配节点租约：
+分配节点租约（区域筛选后可再按能力条件匹配）：
 
 ```bash
 curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/leases \
@@ -109,9 +124,16 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/leases \
     "request_key": "lease-request-0001",
     "region": "east",
     "lease_seconds": 600,
-    "max_nodes": 2
+    "max_nodes": 2,
+    "capability": {
+      "required_protocol_versions": ["doh-http2"],
+      "minimum_capacity_tier": "medium",
+      "required_tags": ["beta"]
+    }
   }'
 ```
+
+`capability` 可整体省略；省略或三个条件都为空时，节点仅按区域规则参与，未声明能力的旧节点照常被选中。命中能力条件时，每个租约的 `explanation.capability` 会固化实际使用的能力档案版本和内容快照，可通过 `GET /v1/leases/<lease_id>` 查看；之后目录升级不会改写它。
 
 提交探针：
 
@@ -167,13 +189,16 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 | `GET` | `/healthz` | 进程健康检查 |
 | `PUT` | `/v1/nodes` | 登记解析节点 |
 | `GET` | `/v1/nodes` | 按状态和区域分页查询节点 |
+| `PUT` | `/v1/nodes/{id}/capabilities` | 登记（去重/升级）节点能力档案 |
+| `GET` | `/v1/nodes/{id}/capabilities` | 按版本列出节点能力档案 |
 | `PUT` | `/v1/plans` | 创建计划草稿 |
 | `GET` | `/v1/plans` | 按状态分页查询计划 |
 | `GET` | `/v1/plans/{id}` | 查询计划 |
 | `PATCH` | `/v1/plans/{id}/revisions` | 添加区域版本 |
 | `PATCH` | `/v1/plans/{id}/activate` | 激活计划 |
 | `PATCH` | `/v1/plans/{id}/complete` | 完成计划 |
-| `PATCH` | `/v1/plans/{id}/leases` | 给节点分配租约 |
+| `PATCH` | `/v1/plans/{id}/leases` | 按区域与能力条件分配租约 |
+| `GET` | `/v1/leases/{id}` | 查询租约及其分配解释 |
 | `PATCH` | `/v1/leases/{id}/release` | 提前释放租约 |
 | `PATCH` | `/v1/leases/{id}/probes` | 登记探针并完成租约 |
 | `PATCH` | `/v1/plans/{id}/assessments` | 创建一致性判定 |
@@ -186,7 +211,11 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 - A、AAAA、CNAME 条目在写入前规范化并稳定排序，重复条目直接拒绝。
 - 节点按 `ready -> leased -> ready` 变化，隔离节点不会被选中。
 - 一个节点同一时刻最多有一个 `claimed` 租约。
-- 相同请求键和相同内容可安全重放；同键异载荷返回 `idempotency_conflict`。
+- 分配先按区域筛选，再按协议版本、容量等级和业务标签匹配能力；未声明能力的旧节点只在无能力条件时参与。
+- 区域内没有 ready 节点返回 `node_unavailable`（409）；有候选但都不满足能力条件返回 `capability_insufficient`（422）。
+- 能力档案只追加：相同内容去重返回既有版本，不同内容追加新版本；租约解释固化所用版本，目录升级不追溯改写。
+- 相同请求键和相同内容可安全重放；同键异载荷（含不同能力条件）返回 `idempotency_conflict`。
+- 并发登记和并发分配由存储写锁串行化：同键重放收敛到同一结果，异键竞争最多一方成功，无重复占用。
 - 一致性判定综合节点覆盖率、序列号、成功比例和最大延迟，返回 `consistent` 或 `review_required`。
 - 所有校验和冲突在快照替换前返回，不留下部分状态。
 
@@ -197,7 +226,7 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 1. 计划草稿、区域版本、激活、完成和版本冲突。
 2. DNS 名称规范化、IP 校验、条目去重和稳定排序。
 3. 序列号递增与重复版本拒绝。
-4. 节点隔离、区域筛选、稳定选择和唯一租约。
+4. 节点隔离、区域筛选、版本化能力匹配、稳定选择和唯一租约。
 5. 租约期限、释放、过期清理和重复释放。
 6. 租约请求键与请求指纹重放。
 7. 探针请求键、载荷指纹、租约完成原子性和冲突检测。
@@ -214,6 +243,7 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 ```bash
 go run ./cmd/workflowprobe plan-revision-lifecycle
 go run ./cmd/workflowprobe node-lease-allocation
+go run ./cmd/workflowprobe node-capability-matching
 go run ./cmd/workflowprobe probe-ingestion
 go run ./cmd/workflowprobe consistency-assessment
 ```

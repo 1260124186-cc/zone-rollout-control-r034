@@ -16,6 +16,9 @@ const (
 	MinRequestKeyRunes = 8
 	MaxRequestKeyRunes = 64
 	MaxEntries         = 500
+	MaxProtocols       = 10
+	MaxCapabilityTags  = 20
+	MaxTagRunes        = 48
 )
 
 type PlanCreateInput struct {
@@ -38,10 +41,18 @@ type NodeCreateInput struct {
 }
 
 type LeaseInput struct {
-	RequestKey   string `json:"request_key"`
-	Region       string `json:"region"`
-	LeaseSeconds int    `json:"lease_seconds"`
-	MaxNodes     int    `json:"max_nodes"`
+	RequestKey   string           `json:"request_key"`
+	Region       string           `json:"region"`
+	LeaseSeconds int              `json:"lease_seconds"`
+	MaxNodes     int              `json:"max_nodes"`
+	Capability   *CapabilityMatch `json:"capability,omitempty"`
+}
+
+// CapabilityProfileInput 是节点能力档案登记请求。
+type CapabilityProfileInput struct {
+	ProtocolVersions []string `json:"protocol_versions"`
+	CapacityTier     string   `json:"capacity_tier"`
+	Tags             []string `json:"tags"`
 }
 
 type ProbeInput struct {
@@ -213,10 +224,161 @@ func ValidateLeaseInput(input LeaseInput) error {
 	if input.MaxNodes < 1 || input.MaxNodes > 100 {
 		details["max_nodes"] = "must be between 1 and 100"
 	}
+	if input.Capability != nil {
+		if err := ValidateCapabilityMatch(*input.Capability); err != nil {
+			details["capability"] = err.Error()
+		}
+	}
 	if len(details) > 0 {
 		return Validation("lease input is invalid", details)
 	}
 	return nil
+}
+
+var allowedProtocols = map[string]struct{}{
+	"dns-udp":     {},
+	"dns-tcp":     {},
+	"doh-http1.1": {},
+	"doh-http2":   {},
+	"doq":         {},
+	"dot":         {},
+}
+
+var capacityRanks = map[CapacityTier]int{
+	CapacitySmall:  1,
+	CapacityMedium: 2,
+	CapacityLarge:  3,
+	CapacityXLarge: 4,
+}
+
+// IsSupportedProtocol 报告协议版本是否在受支持集合内。
+func IsSupportedProtocol(protocol string) bool {
+	_, ok := allowedProtocols[protocol]
+	return ok
+}
+
+// CapacityRank 返回容量等级的可比较序号，未知等级返回 false。
+func CapacityRank(tier CapacityTier) (int, bool) {
+	rank, ok := capacityRanks[tier]
+	return rank, ok
+}
+
+// NormalizeCapabilityProfile 规范化能力档案登记内容：去空白、小写、
+// 去重并稳定排序协议版本与业务标签。
+func NormalizeCapabilityProfile(input CapabilityProfileInput) CapabilityProfileInput {
+	input.ProtocolVersions = normalizeStringSet(input.ProtocolVersions)
+	input.Tags = normalizeStringSet(input.Tags)
+	input.CapacityTier = strings.TrimSpace(strings.ToLower(input.CapacityTier))
+	return input
+}
+
+// NormalizeCapabilityMatch 规范化分配请求中的能力条件。
+func NormalizeCapabilityMatch(match CapabilityMatch) CapabilityMatch {
+	match.RequiredProtocolVersions = normalizeStringSet(match.RequiredProtocolVersions)
+	match.RequiredTags = normalizeStringSet(match.RequiredTags)
+	match.MinimumCapacityTier = strings.TrimSpace(strings.ToLower(match.MinimumCapacityTier))
+	return match
+}
+
+// CapabilityMatchRequested 判断规范化后的能力条件是否提出了任何要求。
+func CapabilityMatchRequested(match CapabilityMatch) bool {
+	return len(match.RequiredProtocolVersions) > 0 ||
+		match.MinimumCapacityTier != "" ||
+		len(match.RequiredTags) > 0
+}
+
+// ValidateCapabilityProfile 校验能力档案登记内容（调用前应先规范化）。
+func ValidateCapabilityProfile(input CapabilityProfileInput) error {
+	details := make(map[string]any)
+	if len(input.ProtocolVersions) < 1 || len(input.ProtocolVersions) > MaxProtocols {
+		details["protocol_versions"] = "must contain between 1 and 10 items"
+	}
+	for _, protocol := range input.ProtocolVersions {
+		if !IsSupportedProtocol(protocol) {
+			details["protocol_versions"] = "contains an unsupported protocol version: " + protocol
+			break
+		}
+	}
+	if _, ok := CapacityRank(CapacityTier(input.CapacityTier)); !ok {
+		details["capacity_tier"] = "must be one of small, medium, large, or xlarge"
+	}
+	if len(input.Tags) > MaxCapabilityTags {
+		details["tags"] = "must contain at most 20 items"
+	}
+	for _, tag := range input.Tags {
+		if err := validateCapabilityTag(tag); err != nil {
+			details["tags"] = err.Error()
+			break
+		}
+	}
+	if len(details) > 0 {
+		return Validation("capability profile input is invalid", details)
+	}
+	return nil
+}
+
+// ValidateCapabilityMatch 校验分配请求中的能力条件（调用前应先规范化）。
+func ValidateCapabilityMatch(match CapabilityMatch) error {
+	details := make(map[string]any)
+	if len(match.RequiredProtocolVersions) > MaxProtocols {
+		details["required_protocol_versions"] = "must contain at most 10 items"
+	}
+	for _, protocol := range match.RequiredProtocolVersions {
+		if !IsSupportedProtocol(protocol) {
+			details["required_protocol_versions"] = "contains an unsupported protocol version: " + protocol
+			break
+		}
+	}
+	if match.MinimumCapacityTier != "" {
+		if _, ok := CapacityRank(CapacityTier(match.MinimumCapacityTier)); !ok {
+			details["minimum_capacity_tier"] = "must be one of small, medium, large, or xlarge"
+		}
+	}
+	if len(match.RequiredTags) > MaxCapabilityTags {
+		details["required_tags"] = "must contain at most 20 items"
+	}
+	for _, tag := range match.RequiredTags {
+		if err := validateCapabilityTag(tag); err != nil {
+			details["required_tags"] = err.Error()
+			break
+		}
+	}
+	if len(details) > 0 {
+		return Validation("capability match is invalid", details)
+	}
+	return nil
+}
+
+func validateCapabilityTag(tag string) error {
+	count := utf8.RuneCountInString(tag)
+	if count < 1 || count > MaxTagRunes {
+		return Validation("tags must contain between 1 and 48 characters", nil)
+	}
+	for _, r := range tag {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			continue
+		}
+		return Validation("tags may contain only lowercase letters, digits, hyphens, and underscores", nil)
+	}
+	return nil
+}
+
+func normalizeStringSet(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := strings.TrimSpace(strings.ToLower(value))
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func ValidateProbeInput(input ProbeInput, now time.Time) error {

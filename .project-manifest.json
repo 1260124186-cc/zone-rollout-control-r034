@@ -24,9 +24,14 @@
       "responsibility": "resolver node enrollment, uniqueness checks, and paginated reads"
     },
     {
+      "id": "capability",
+      "path": "internal/capability",
+      "responsibility": "versioned node capability profiles, content-deduplicated registration, and catalog reads"
+    },
+    {
       "id": "allocation",
       "path": "internal/allocation",
-      "responsibility": "node selection, idempotent lease groups, and resource lifetime"
+      "responsibility": "region and capability matching, idempotent lease groups, resource lifetime, and lease explanations"
     },
     {
       "id": "probe",
@@ -109,6 +114,29 @@
         "httpapi",
         "allocation",
         "plan",
+        "domain",
+        "storage"
+      ]
+    },
+    {
+      "id": "node-capability-matching",
+      "name": "Versioned node capability matching",
+      "entry": "PUT /v1/nodes/{id}/capabilities and PATCH /v1/plans/{id}/leases with capability conditions",
+      "steps": [
+        "register a versioned capability profile with protocol versions, capacity tier, and business tags",
+        "deduplicate identical content and append a new version on change",
+        "filter ready nodes by region, then match the latest capability profile against explicit conditions",
+        "freeze the matched capability profile version snapshot into each lease explanation",
+        "distinguish capability_insufficient from node_unavailable and serialize concurrent requests"
+      ],
+      "success": "capability conditions select only matching nodes, lease explanations pin the used profile version, and catalog upgrades never rewrite existing leases",
+      "failure": "nodes without profiles join region-only allocation, unmatched regional candidates fail as capability_insufficient, and empty regions fail as node_unavailable",
+      "verification": "workflowprobe node-capability-matching covers dedupe, upgrade immutability, matching, error distinction, and same-key and distinct-key concurrency",
+      "module_ids": [
+        "httpapi",
+        "capability",
+        "allocation",
+        "fleet",
         "domain",
         "storage"
       ]

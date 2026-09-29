@@ -17,6 +17,10 @@
       "command": "go run ./cmd/workflowprobe node-lease-allocation"
     },
     {
+      "workflow_id": "node-capability-matching",
+      "command": "go run ./cmd/workflowprobe node-capability-matching"
+    },
+    {
       "workflow_id": "probe-ingestion",
       "command": "go run ./cmd/workflowprobe probe-ingestion"
     },
